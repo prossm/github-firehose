@@ -18,6 +18,14 @@ Needs Node 20.12 or newer. There is nothing to install.
    micro .env
    ```
 
+   Paste the token after `GITHUB_TOKEN=` with no spaces or quotes, so the line reads:
+
+   ```
+   GITHUB_TOKEN=github_pat_xxxxxxxxxxxxxxxxxxxx
+   ```
+
+   Save with Ctrl-S and quit with Ctrl-Q. Without a token the screen still works, it just polls less often (GitHub allows 60 unauthenticated requests an hour).
+
 2. Start the server:
 
    ```
