@@ -1,0 +1,1010 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GitHub Firehose</title>
+<!--
+  GitHub Firehose lobby screen.
+  Run `node server.mjs` next to this file, open http://localhost:8787, press F.
+  The server talks to GitHub (with the token from .env); this page only reads /api/events.
+  URL options: ?demo (made-up events, works from file:// too) ?clean ?title=... ?cta=...
+    ?since=5:30pm  start time (default DEFAULT_SINCE). Nothing earlier is shown, and the
+                   tally is saved in this browser, so reloads continue it instead of resetting.
+  Click any line to open it on github.com (the commit range, PR, comment, release...).
+  Test-only: ?mock=ratelimit | ?mock=offline | ?mock=blocked (these use demo data).
+
+  PAYLOAD NOTES (live GET /events?per_page=100&page=1..3, checked 2026-11-19):
+  - Freshness: page 1 was almost entirely stale (1 of 100 events under an hour old, the rest
+    up to 38 hours). Pages 2 and 3 were ~85% under 10 minutes old. So the server fetches
+    all three pages and keeps only the last hour: about 170 fresh events a minute.
+  - Mix: mostly PushEvent, then CreateEvent, PullRequestEvent, IssuesEvent, IssueCommentEvent.
+  - PushEvent payload: ref, head, before, push_id, repository_id. No commits, no messages,
+    no size. So the detail column shows the branch name.
+  - PullRequestEvent payload: action, number, pull_request.{id, number, url, head.ref/sha,
+    base.ref/sha}. No title, no merged flag. Merges arrive as action "merged" (the old
+    "closed" + merged=true form is still handled). Detail falls back to "#number".
+  - PullRequestReviewCommentEvent: comment.* is full, pull_request has number but no title.
+  - CreateEvent: ref, ref_type, full_ref, master_branch, description (the repo description,
+    present even for branch creates), pusher_type.
+  - DeleteEvent: ref, ref_type, full_ref, pusher_type.
+  - actor.display_login drops the "[bot]" suffix (github-actions[bot] -> github-actions),
+    so classification uses actor.login.
+-->
+<style>
+  :root {
+    --bg: #0b0f14;
+    --panel-line: #1b222c;
+    --track: #151b23;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --dim: #6e7681;
+    --live: #3fb950;
+    --warn: #d29922;
+    --agent: #d2a8ff;
+    --bot: #7d8590;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    /* ~22px at 1920x1080; scales with whichever of width/height is tighter. */
+    font-size: min(1.146vw, 2.037vh);
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: var(--bg); color: var(--text);
+    user-select: none; -webkit-user-select: none;
+  }
+  ::selection { background: transparent; }
+  body {
+    display: grid; grid-template-rows: auto minmax(0, 1fr) auto;
+    font-family: var(--sans); font-size: 1rem;
+  }
+  body.nocursor, body.nocursor * { cursor: none !important; }
+
+  /* Header */
+  header {
+    display: flex; align-items: center; justify-content: space-between; gap: 2rem;
+    padding: 1.1rem 1.6rem 1rem; border-bottom: 1px solid var(--panel-line);
+  }
+  .title { display: flex; align-items: center; gap: 1rem; min-width: 0; }
+  .title h1 { margin: 0; font-size: 2rem; font-weight: 700; letter-spacing: -0.01em; line-height: 1.15; }
+  .title p { margin: 0.2rem 0 0; font-size: 1.1rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .title > div { min-width: 0; }
+  .dot {
+    flex: none; width: 0.8rem; height: 0.8rem; border-radius: 50%;
+    background: var(--live); color: var(--live);
+    animation: pulse 2s ease-in-out infinite;
+  }
+  .dot.warn { background: var(--warn); color: var(--warn); }
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 0 0 currentColor; opacity: 1; }
+    50% { box-shadow: 0 0 0 0.35rem transparent; opacity: 0.6; }
+  }
+  .count { text-align: right; flex: none; }
+  .count b { display: block; font-size: 3rem; line-height: 1; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .count span { font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.12em; }
+
+  /* Main: feed + panel */
+  main { display: grid; grid-template-columns: 70fr 30fr; min-height: 0; }
+  #feed {
+    position: relative; overflow: hidden; padding: 0.5rem 1.6rem 0;
+    font-family: var(--mono); font-size: 1rem;
+    display: flex; flex-direction: column; min-height: 0;
+  }
+  /* Column headers share the line grid, so they always line up with the columns. */
+  .feed-head { flex: none; border-bottom: 1px solid var(--panel-line); margin-bottom: 0.3rem; }
+  .feed-head > span {
+    font-family: var(--sans); font-size: 0.72rem; font-weight: 700; color: var(--muted);
+    letter-spacing: 0.12em; text-transform: uppercase; align-self: center;
+  }
+  /* Clips the sliding list below the headers. */
+  .feed-body { flex: 1; min-height: 0; overflow: hidden; }
+  /* Paused: the feed holds still and can be scrolled back; the bottom fade lifts so
+     older lines are readable. Live, there are no scrollbars at all. */
+  body.paused .feed-body { overflow-y: auto; scrollbar-width: thin; scrollbar-color: #30363d transparent; }
+  body.paused #feed::after { opacity: 0; }
+  #feed::after { transition: opacity 0.3s; }
+  /* Fade the bottom 40%. An overlay, not mask-image: masks over animated content
+     repaint badly in some compositors, and this has to run for hours. */
+  #feed::after {
+    content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 40%;
+    background: linear-gradient(to bottom, rgba(11, 15, 20, 0), var(--bg));
+    pointer-events: none;
+  }
+  .line {
+    display: grid; column-gap: 1ch; line-height: 1.6; white-space: nowrap;
+    grid-template-columns: 11ch 1.5ch 17ch 20ch minmax(0, 1.4fr) minmax(0, 1fr);
+  }
+  body.clean .line { grid-template-columns: 11ch 1.5ch 17ch 20ch minmax(0, 1fr); }
+  body.clean .detail { display: none; }
+  .line > span { overflow: hidden; text-overflow: ellipsis; }
+  a.line { color: inherit; text-decoration: none; border-radius: 0.2rem; }
+  a.line[href]:hover { background: #161b22; }
+  a.line[href]:hover .repo { text-decoration: underline; }
+  .time, .verb, .detail { color: var(--muted); }
+  .time { color: var(--dim); font-variant-numeric: tabular-nums; }
+  .glyph { text-align: center; font-weight: 700; }
+  .actor.agent { color: var(--agent); }
+  .actor.bot { color: var(--bot); }
+  .who-icon { width: 1em; height: 1em; margin-right: 0.4em; vertical-align: -0.14em; flex: none; }
+  .repo { color: var(--text); font-weight: 600; }
+
+  aside {
+    border-left: 1px solid var(--panel-line); padding: 1.1rem 1.4rem;
+    display: flex; flex-direction: column; gap: 0.8rem; overflow: hidden; min-width: 0;
+  }
+  aside h2 { margin: 0 0 0.35rem; font-size: 0.78rem; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); }
+  .note { margin: -0.25rem 0 0.4rem; font-size: 0.72rem; color: var(--dim); }
+  .rows { font-size: 0.85rem; }
+  .bar {
+    display: grid; align-items: center; column-gap: 0.7em; line-height: 1.5;
+    grid-template-columns: 11.5em minmax(0, 1fr) 3.4em;
+  }
+  #who .bar { grid-template-columns: 8em minmax(0, 1fr) 3.4em; }
+  .bar .label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .bar .val { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+  .track { height: 0.55em; border-radius: 0.3em; background: var(--track); overflow: hidden; }
+  .fill { height: 100%; width: 0; border-radius: 0.3em; transition: width 0.6s ease; }
+  .repo-row {
+    display: grid; grid-template-columns: 2.2em minmax(0, 1fr) auto; column-gap: 0.5em;
+    line-height: 1.5; font-family: var(--mono); font-size: 0.85rem;
+  }
+  .repo-row .n, .repo-row .c { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .repo-row .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  a.repo-row { color: inherit; text-decoration: none; border-radius: 0.2rem; }
+  a.repo-row[href]:hover { background: #161b22; }
+  a.repo-row[href]:hover .name { text-decoration: underline; }
+  #cta {
+    margin-top: auto; padding: 0.9rem 1rem; border: 1px solid #30363d; border-left: 0.25rem solid var(--live);
+    border-radius: 0.4rem; background: #10161d; font-size: 1.05rem; font-weight: 600; line-height: 1.35;
+    overflow-wrap: anywhere;
+  }
+  #cta[hidden] { display: none; }
+
+  /* Footer */
+  footer {
+    display: flex; justify-content: space-between; gap: 2rem; align-items: center;
+    padding: 0.65rem 1.6rem; border-top: 1px solid var(--panel-line);
+    font-size: 0.8rem; color: var(--muted); white-space: nowrap;
+  }
+  footer > div { overflow: hidden; text-overflow: ellipsis; }
+  #hint { color: var(--dim); margin-left: 1.5em; }
+  #status.warn { color: var(--warn); }
+  .footer-right { display: flex; align-items: center; gap: 1em; min-width: 0; }
+  .footer-right #status { overflow: hidden; text-overflow: ellipsis; }
+  #pause {
+    flex: none; font: inherit; font-weight: 600; color: var(--text); cursor: pointer;
+    background: #161b22; border: 1px solid #30363d; border-radius: 0.3rem; padding: 0.15em 0.7em;
+  }
+  #pause:hover { background: #1f2630; }
+  body.paused #pause { background: var(--warn); border-color: var(--warn); color: #0b0f14; }
+  /* Off the TV until someone moves the mouse (unless paused, so it's clear how to resume). */
+  body.nocursor:not(.paused) #pause { visibility: hidden; }
+</style>
+</head>
+<body>
+<header>
+  <div class="title">
+    <div class="dot" id="dot"></div>
+    <div>
+      <h1>Right now on GitHub</h1>
+      <p id="subtitle"></p>
+    </div>
+  </div>
+  <div class="count"><b id="total">0</b><span id="total-label">events since doors open</span></div>
+</header>
+
+<main>
+  <div id="feed" aria-live="off">
+    <div class="line feed-head" aria-hidden="true">
+      <span class="time">Time</span><span class="glyph"></span><span class="actor">Who</span><span class="verb">Did what</span><span class="repo">Repo</span><span class="detail">Details</span>
+    </div>
+    <div class="feed-body"><div id="lines"></div></div>
+  </div>
+  <aside>
+    <section id="who">
+      <h2>Who's doing the work</h2>
+      <p class="note">by login name, so it's a guess</p>
+      <div class="rows"></div>
+    </section>
+    <section id="kinds">
+      <h2>What kind of work</h2>
+      <div class="rows"></div>
+    </section>
+    <section id="repos">
+      <h2>Busiest repos tonight</h2>
+      <div class="rows"></div>
+    </section>
+    <div id="cta" hidden></div>
+  </aside>
+</main>
+
+<footer>
+  <div>Public activity from api.github.com/events, last hour only<span id="hint">Press F for full screen</span></div>
+  <div class="footer-right">
+    <button id="pause" type="button" title="Pause to scroll back (P)">❚❚ Pause</button>
+    <span id="status">Connecting…</span>
+  </div>
+</footer>
+
+<script>
+"use strict";
+
+// ---- Tunables -------------------------------------------------------------
+// GitHub polling, tokens and rate limits live in server.mjs. These are page-side only.
+const API_PATH = "/api/events";
+const SERVER_SLACK_MS = 1_500;     // ask the server just after its next GitHub poll
+const SERVER_RETRY_START_MS = 5_000; // server unreachable: 5s, 10s, 20s ... capped
+const SERVER_RETRY_MAX_MS = 60_000;
+const FETCH_TIMEOUT_MS = 10_000;
+const DEMO_POLL_MS = 60_000;
+const DEMO_PER_MINUTE = 170;       // roughly what the live server delivers
+const MAX_FEED_LINES = 200;       // also the scrollback while paused
+const FIRST_RENDER = 15;
+const DRIP_MIN_MS = 250;
+const DRIP_MAX_MS = 4_000;
+const DRIP_IDLE_MS = 500;
+const PANEL_REFRESH_MS = 2_000;
+const MAX_SEEN_IDS = 2_000;
+const MAX_BUFFER = 400;
+const REPO_TALLY_KEEP = 500;
+const TOP_REPOS = 10;              // rows in "Busiest repos tonight"
+const DETAIL_MAX = 80;
+const CURSOR_HIDE_MS = 3_000;
+const DEFAULT_TITLE = "Welcome to The Product Group Hudson Valley";
+// Earliest event time shown and counted, in the laptop's local time. ?since=6pm overrides.
+const DEFAULT_SINCE = "5:30pm";
+const SAVE_LINES = 30;             // lines restored on screen after a reload
+
+// Classification order matters: agents first, because many log in as "name[bot]".
+const AGENT_PATTERN = /copilot|claude|devin|codex|cursor|jules|openhands|coderabbit|sweep|gemini|codegen|aider/i;
+const BOT_PATTERN = /(\[bot\]|bot)$/i;
+
+// Tested against actor login, repo name and detail. Substring matches on purpose:
+// over-blocking costs nothing. A few short words get a left boundary to spare
+// common words like "grape", "torpedo", "analytics".
+const BLOCKLIST = new RegExp([
+  "fuck", "shit", "cunt", "bitch", "bastard", "asshole", "dick", "cocksuck", "pussy", "wank",
+  "jizz", "cumshot", "(?<![a-z])cum(?![a-z])", "slut", "whore", "porn", "nsfw", "xxx", "hentai",
+  "nude", "naked", "sex", "erotic", "fetish", "bdsm", "blowjob", "handjob", "gangbang", "incest",
+  "milf", "onlyfans", "camgirl", "boob", "tits", "dildo", "vagina", "penis", "orgasm", "xvideo",
+  "xhamster", "lolicon", "shota", "(?<![a-z])anal(?![a-z])", "(?<![a-z])rape", "(?<![a-z])pedo",
+  "nigg", "fag", "retard", "kike", "chink", "(?<![a-z])spic(?![a-z])", "tranny", "dyke",
+  "nazi", "hitler", "kys(?![a-z])", "killyourself", "kill-yourself", "kill_yourself", "suicide",
+].join("|"), "i");
+
+const GROUPS = {
+  push:    { label: "Pushes",                 color: "#3fb950" },
+  pr:      { label: "Pull requests",          color: "#a371f7" },
+  issue:   { label: "Issues and comments",    color: "#f0883e" },
+  star:    { label: "Stars",                  color: "#e3b341" },
+  fork:    { label: "Forks",                  color: "#58a6ff" },
+  create:  { label: "New branches and repos", color: "#39c5cf" },
+  release: { label: "Releases",               color: "#db61a2" },
+  other:   { label: "Everything else",        color: "#8b949e" },
+};
+const WHO = {
+  person: { label: "People",    color: "#e6edf3" },
+  bot:    { label: "Bots",      color: "#7d8590", icon: "bot" },
+  agent:  { label: "AI agents", color: "#d2a8ff", icon: "sparkle" },
+};
+
+// ---- URL options ------------------------------------------------------------
+const params = new URLSearchParams(location.search);
+const MOCK = params.get("mock") || "";
+const DEMO = params.has("demo") || MOCK !== "";
+const CLEAN = params.has("clean");
+
+// "5:30pm", "5:30 PM", "17:30", "6pm" -> today at that local time.
+function parseSince(text) {
+  const m = String(text).trim().match(/^(\d{1,2})(?::(\d{2}))?\s*([ap])?\.?m?\.?$/i);
+  if (!m) return null;
+  let h = Number(m[1]);
+  const min = Number(m[2] || 0);
+  const ap = (m[3] || "").toLowerCase();
+  if (ap === "p" && h < 12) h += 12;
+  if (ap === "a" && h === 12) h = 0;
+  if (h > 23 || min > 59) return null;
+  const d = new Date();
+  d.setHours(h, min, 0, 0);
+  return d.getTime();
+}
+const SINCE_AT = parseSince(params.get("since") || DEFAULT_SINCE) ?? parseSince(DEFAULT_SINCE);
+// Demo events are always "now", so demo mode doesn't filter by start time.
+const SINCE_FILTER = DEMO ? 0 : SINCE_AT;
+
+document.getElementById("subtitle").textContent = params.get("title") || DEFAULT_TITLE;
+if (CLEAN) document.body.classList.add("clean");
+if (params.get("cta")) {
+  const cta = document.getElementById("cta");
+  cta.textContent = params.get("cta");
+  cta.hidden = false;
+}
+
+// ---- Turning events into lines ----------------------------------------------
+function classify(login) {
+  if (AGENT_PATTERN.test(login)) return "agent";
+  if (BOT_PATTERN.test(login)) return "bot";
+  return "person";
+}
+
+function clip(text) {
+  if (typeof text !== "string") return "";
+  const line = text.split(/\r?\n/).map(s => s.trim()).find(Boolean) || "";
+  return line.slice(0, DETAIL_MAX);
+}
+
+function prRef(p) {
+  const title = p?.pull_request?.title;
+  if (title) return title;
+  const n = p?.pull_request?.number ?? p?.number;
+  return n != null ? "#" + n : "";
+}
+
+function mapEvent(e) {
+  const p = e?.payload || {};
+  const type = String(e?.type || "");
+  let group = "other", glyph = "·", verb, detail = "";
+
+  switch (type) {
+    case "PushEvent": {
+      group = "push"; glyph = "↑"; verb = "pushed to";
+      const commits = p?.commits;
+      detail = (Array.isArray(commits) && commits.length && commits[commits.length - 1]?.message)
+        || String(p?.ref || "").replace(/^refs\/heads\//, "");
+      break;
+    }
+    case "PullRequestEvent": {
+      group = "pr"; glyph = "⇄";
+      let a = p?.action;
+      if (a === "closed" && p?.pull_request?.merged) a = "merged";
+      verb = ["opened", "merged", "closed", "reopened"].includes(a) ? `${a} a PR in` : "updated a PR in";
+      detail = prRef(p);
+      break;
+    }
+    case "PullRequestReviewEvent":
+      group = "pr"; glyph = "⇄"; verb = "reviewed a PR in"; detail = prRef(p); break;
+    case "PullRequestReviewCommentEvent":
+      group = "pr"; glyph = "⇄"; verb = "commented on a PR in"; detail = prRef(p); break;
+    case "IssuesEvent": {
+      group = "issue"; glyph = "○";
+      const a = p?.action;
+      verb = ["opened", "closed", "reopened"].includes(a) ? `${a} an issue in` : "updated an issue in";
+      detail = p?.issue?.title || (p?.issue?.number != null ? "#" + p.issue.number : "");
+      break;
+    }
+    case "IssueCommentEvent":
+      group = "issue"; glyph = "○"; verb = "commented in";
+      detail = p?.issue?.title || (p?.issue?.number != null ? "#" + p.issue.number : "");
+      break;
+    case "CommitCommentEvent":
+      group = "issue"; glyph = "○"; verb = "commented on a commit in"; break;
+    case "DiscussionEvent":
+      group = "issue"; glyph = "○"; verb = "started a discussion in"; detail = p?.discussion?.title; break;
+    case "WatchEvent":
+      group = "star"; glyph = "★"; verb = "starred"; break;
+    case "ForkEvent":
+      group = "fork"; glyph = "⑂"; verb = "forked"; break;
+    case "CreateEvent":
+      group = "create"; glyph = "+";
+      if (p?.ref_type === "repository") { verb = "created"; detail = p?.description; }
+      else { verb = p?.ref_type === "tag" ? "created a tag in" : "created a branch in"; detail = p?.ref; }
+      break;
+    case "DeleteEvent":
+      group = "create"; glyph = "−";
+      verb = p?.ref_type === "tag" ? "deleted a tag in" : "deleted a branch in"; detail = p?.ref;
+      break;
+    case "ReleaseEvent":
+      group = "release"; glyph = "◆"; verb = "released"; detail = p?.release?.tag_name || p?.release?.name; break;
+    case "PublicEvent": verb = "open-sourced"; break;
+    case "MemberEvent": verb = "added a collaborator to"; break;
+    case "GollumEvent": verb = "edited the wiki of"; break;
+    default:
+      verb = (type.replace(/Event$/, "").toLowerCase() || "activity") + " in";
+  }
+
+  // Show display_login, but classify by login: display_login drops the "[bot]" suffix.
+  const login = String(e?.actor?.login || e?.actor?.display_login || "someone");
+  const actor = String(e?.actor?.display_login || login);
+  return {
+    id: String(e?.id ?? ""),
+    at: new Date(e?.created_at || Date.now()),
+    group, glyph, verb, actor,
+    login,
+    who: classify(login),
+    repo: String(e?.repo?.name || ""),
+    url: e?.repo?.name ? linkFor(type, p, String(e.repo.name)) : "",
+    detail: clip(detail),
+  };
+}
+
+// Where a click on the line goes: the commit, PR, comment, release... on github.com.
+// Only https://github.com/ links are ever used; anything else falls back to the repo.
+const GH = "https://github.com/";
+const ZERO_SHA = /^0+$/;
+
+function ghUrl(u) {
+  return typeof u === "string" && u.startsWith(GH) ? u : "";
+}
+
+function linkFor(type, p, repo) {
+  const base = GH + repo.split("/").map(encodeURIComponent).join("/");
+  const path = (...parts) => base + "/" + parts.map(x => encodeURIComponent(String(x))).join("/");
+  const prNum = p?.pull_request?.number ?? p?.number;
+  const issueNum = p?.issue?.number;
+  switch (type) {
+    case "PushEvent": {
+      const head = /^[0-9a-f]{7,40}$/i.test(p?.head || "") ? p.head : "";
+      const before = /^[0-9a-f]{7,40}$/i.test(p?.before || "") && !ZERO_SHA.test(p.before) ? p.before : "";
+      if (head && before) return `${base}/compare/${before}...${head}`;
+      if (head) return path("commit", head);
+      return base;
+    }
+    case "PullRequestEvent":
+      return ghUrl(p?.pull_request?.html_url) || (prNum != null ? path("pull", prNum) : base);
+    case "PullRequestReviewEvent":
+      return ghUrl(p?.review?.html_url) || (prNum != null ? path("pull", prNum) : base);
+    case "PullRequestReviewCommentEvent":
+      return ghUrl(p?.comment?.html_url) || (prNum != null ? path("pull", prNum) : base);
+    case "IssuesEvent":
+      return ghUrl(p?.issue?.html_url) || (issueNum != null ? path("issues", issueNum) : base);
+    case "IssueCommentEvent":
+      return ghUrl(p?.comment?.html_url) || ghUrl(p?.issue?.html_url) || (issueNum != null ? path("issues", issueNum) : base);
+    case "CommitCommentEvent":
+      return ghUrl(p?.comment?.html_url) || base;
+    case "DiscussionEvent":
+      return ghUrl(p?.discussion?.html_url) || base + "/discussions";
+    case "ReleaseEvent":
+      return ghUrl(p?.release?.html_url) || (p?.release?.tag_name ? path("releases", "tag", p.release.tag_name) : base + "/releases");
+    case "ForkEvent":
+      return p?.forkee?.full_name ? GH + p.forkee.full_name.split("/").map(encodeURIComponent).join("/") : base;
+    case "CreateEvent":
+      return p?.ref_type !== "repository" && p?.ref ? base + "/tree/" + String(p.ref).split("/").map(encodeURIComponent).join("/") : base;
+    case "GollumEvent":
+      return base + "/wiki";
+    default:
+      return base;
+  }
+}
+
+function isBlocked(line) {
+  return BLOCKLIST.test(line.login) || BLOCKLIST.test(line.actor) || BLOCKLIST.test(line.repo) || BLOCKLIST.test(line.detail);
+}
+
+// ---- State ------------------------------------------------------------------
+const buffer = [];
+const seenIds = new Set();
+const seenOrder = [];
+const stats = {
+  total: 0,
+  who: { person: 0, bot: 0, agent: 0 },
+  group: Object.fromEntries(Object.keys(GROUPS).map(k => [k, 0])),
+  repos: new Map(),
+};
+const net = {
+  // live | ratelimit | busy | offline (these four come from the server) | noserver | connecting
+  state: "connecting",
+  nextPollAt: Date.now(),
+  resumeAt: 0,
+  backoff: 0,
+  lagMs: null,
+  timer: 0,
+  inFlight: false,
+  log: [],               // last few poll outcomes, for testing; never printed
+};
+let paused = false;
+let firstBatchShown = false;
+let lastShownAt = 0;           // created_at of the newest line rendered so far
+const recent = [];             // last few lines rendered, saved for reloads
+
+// ---- Saving the tally across reloads ------------------------------------------------------
+// Kept in this browser's localStorage, one entry per start time. Restoring lastShownAt
+// means events already counted before a reload are not counted again. Test modes don't save.
+const SAVE_KEY = MOCK ? null : `firehose:${DEMO ? "demo:" : ""}${SINCE_AT}`;
+
+function saveState() {
+  if (!SAVE_KEY) return;
+  try {
+    localStorage.setItem(SAVE_KEY, JSON.stringify({
+      total: stats.total, who: stats.who, group: stats.group,
+      repos: [...stats.repos].sort((a, b) => b[1] - a[1]).slice(0, REPO_TALLY_KEEP),
+      lastShownAt: +lastShownAt,
+      recent: recent.map(l => ({ ...l, at: +l.at })),
+    }));
+    // Drop tallies from other nights.
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith("firehose:") && k !== SAVE_KEY) localStorage.removeItem(k);
+    }
+  } catch (_) { /* storage blocked or full: the tally just won't survive a reload */ }
+}
+
+function restoreState() {
+  if (!SAVE_KEY) return;
+  try {
+    const saved = JSON.parse(localStorage.getItem(SAVE_KEY) || "null");
+    if (!saved) return;
+    stats.total = Number(saved.total) || 0;
+    for (const k of Object.keys(stats.who)) stats.who[k] = Number(saved.who?.[k]) || 0;
+    for (const k of Object.keys(stats.group)) stats.group[k] = Number(saved.group?.[k]) || 0;
+    stats.repos = new Map(Array.isArray(saved.repos) ? saved.repos : []);
+    lastShownAt = Number(saved.lastShownAt) || 0;
+    for (const l of Array.isArray(saved.recent) ? saved.recent : []) {
+      if (!GROUPS[l.group] || !WHO[l.who]) continue;
+      const line = { ...l, at: new Date(l.at), url: ghUrl(l.url) };
+      recent.push(line);
+      render(line, false, 0, false);
+    }
+    if (recent.length) firstBatchShown = true;
+    totalEl.textContent = stats.total.toLocaleString();
+  } catch (_) { /* unreadable: start fresh */ }
+}
+
+// ---- Fetching from server.mjs ------------------------------------------------------
+// The page never talks to GitHub directly. server.mjs polls it with the token from .env
+// and hands over only new events from the last hour.
+let cursor = 0;
+let mockCalls = 0;
+
+async function getBatch() {
+  mockCalls++;
+  // Mocks fail after one good batch, so the drip has something to keep going with.
+  if (MOCK === "offline" && mockCalls >= 2 && mockCalls <= 4) throw new TypeError("mock: server unreachable");
+  if (MOCK === "ratelimit" && mockCalls === 2) {
+    return { events: [], state: "ratelimit", resumeInMs: 120_000, nextPollInMs: 120_000, lagMs: 180_000 };
+  }
+  if (DEMO) return { events: demoBatch(), state: "live", nextPollInMs: DEMO_POLL_MS, lagMs: 180_000 };
+
+  const res = await fetch(`${API_PATH}?since=${cursor}`, { cache: "no-store", signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+  if (!res.ok) throw new Error("server said " + res.status);
+  const data = await res.json();
+  cursor = Number(data.cursor) || 0;
+  return data;
+}
+
+function schedulePoll(ms) {
+  clearTimeout(net.timer);
+  net.nextPollAt = Date.now() + ms;
+  net.timer = setTimeout(poll, ms);
+}
+
+async function poll() {
+  if (net.inFlight) return;
+  net.inFlight = true;
+  let outcome;
+  try {
+    if (location.protocol === "file:" && !DEMO) throw new Error("opened from disk");
+    const data = await getBatch();
+    outcome = data.state;
+    net.backoff = 0;
+    ingest(data.events);
+    net.state = data.state || "live";
+    if (data.lagMs != null) net.lagMs = data.lagMs;
+    net.resumeAt = data.resumeInMs != null ? Date.now() + data.resumeInMs : 0;
+    // The server polls GitHub on its own clock; come back just after its next poll.
+    // The drip spreads this batch across that wait.
+    const wait = (Number(data.nextPollInMs) || 0) + SERVER_SLACK_MS;
+    schedulePoll(Math.min(Math.max(wait, 2_000), 5 * 60_000));
+  } catch (err) {
+    outcome = "noserver";
+    net.state = "noserver";
+    if (location.protocol !== "file:" || DEMO) {
+      net.backoff = net.backoff ? Math.min(net.backoff * 2, SERVER_RETRY_MAX_MS) : SERVER_RETRY_START_MS;
+      schedulePoll(net.backoff);
+    }
+  } finally {
+    net.inFlight = false;
+    net.log.push({ at: Date.now(), outcome, state: net.state, next: net.nextPollAt - Date.now() });
+    if (net.log.length > 20) net.log.shift();
+    updateStatus();
+  }
+}
+
+function ingest(events) {
+  if (!Array.isArray(events)) return;
+  const fresh = [];
+  for (const e of events) {
+    const id = String(e?.id ?? "");
+    if (!id || seenIds.has(id)) continue;
+    seenIds.add(id);
+    seenOrder.push(id);
+    if (seenOrder.length > MAX_SEEN_IDS) seenIds.delete(seenOrder.shift());
+    const line = mapEvent(e);
+    if (!line.repo || isBlocked(line)) continue;
+    // Time only moves forward on screen. GitHub delivers some events late (a batch is
+    // mostly ~5 min old plus stragglers up to an hour old); anything older than the
+    // last line shown is dropped rather than making the time column jump backwards.
+    if (line.at < lastShownAt || line.at < SINCE_FILTER) continue;
+    fresh.push(line);
+  }
+  // Merge with what's still waiting, so a new batch slots in by time, not after it.
+  buffer.push(...fresh);
+  buffer.sort((a, b) => a.at - b.at);
+  if (buffer.length > MAX_BUFFER) buffer.splice(0, buffer.length - MAX_BUFFER);
+
+  if (!firstBatchShown && buffer.length) {
+    firstBatchShown = true;
+    const n = Math.min(FIRST_RENDER, buffer.length);
+    for (let i = 0; i < n; i++) render(buffer.shift(), false);
+    updatePanel();
+  }
+}
+
+// ---- Rendering ----------------------------------------------------------------
+const feed = document.getElementById("lines"); // inner list moves; #feed and its mask stay put
+const totalEl = document.getElementById("total");
+const timeFmt = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit", second: "2-digit" });
+const clockFmt = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" });
+
+function cell(cls, text) {
+  const s = document.createElement("span");
+  s.className = cls;
+  s.textContent = text;   // textContent only: every string here comes from strangers
+  return s;
+}
+
+// Bots and agents get an icon before the login, so they stand out at a glance.
+// Inline SVG drawn in currentColor, so each icon takes its group's color.
+const ICONS = {
+  // A robot head: antenna, rounded face, two eyes.
+  bot: [
+    ["path", { d: "M8 1.5v2.5", fill: "none", stroke: "currentColor", "stroke-width": 1.5, "stroke-linecap": "round" }],
+    ["circle", { cx: 8, cy: 1.5, r: 1.2, fill: "currentColor" }],
+    ["rect", { x: 2, y: 4.5, width: 12, height: 9.5, rx: 2.5, fill: "none", stroke: "currentColor", "stroke-width": 1.5 }],
+    ["circle", { cx: 5.6, cy: 9, r: 1.3, fill: "currentColor" }],
+    ["circle", { cx: 10.4, cy: 9, r: 1.3, fill: "currentColor" }],
+    ["path", { d: "M0.75 8v3M15.25 8v3", fill: "none", stroke: "currentColor", "stroke-width": 1.5, "stroke-linecap": "round" }],
+  ],
+  // A four-point sparkle with a small companion: the common "AI" mark.
+  sparkle: [
+    ["path", { d: "M7 2C7.5 6 9 7.5 13 8C9 8.5 7.5 10 7 14C6.5 10 5 8.5 1 8C5 7.5 6.5 6 7 2Z", fill: "currentColor" }],
+    ["path", { d: "M13 0.5C13.2 2 13.9 2.7 15.5 3C13.9 3.3 13.2 4 13 5.5C12.8 4 12.1 3.3 10.5 3C12.1 2.7 12.8 2 13 0.5Z", fill: "currentColor" }],
+  ],
+};
+
+function makeIcon(name) {
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", "0 0 16 16");
+  svg.setAttribute("class", "who-icon");
+  svg.setAttribute("aria-hidden", "true");
+  for (const [tag, attrs] of ICONS[name] || []) {
+    const el = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+    svg.append(el);
+  }
+  return svg;
+}
+
+function actorCell(line) {
+  const c = cell("actor " + line.who, "");
+  const icon = WHO[line.who]?.icon;
+  if (icon) c.append(makeIcon(icon));
+  c.append(line.actor);
+  return c;
+}
+
+function render(line, animate = true, duration = 400, count = true) {
+  const row = document.createElement("a");
+  row.className = "line";
+  if (line.url) {
+    row.href = line.url;
+    row.target = "_blank";
+    row.rel = "noopener noreferrer";
+  }
+  const glyph = cell("glyph", line.glyph);
+  glyph.style.color = GROUPS[line.group].color;
+  row.append(
+    cell("time", timeFmt.format(line.at)),
+    glyph,
+    actorCell(line),
+    cell("verb", line.verb),
+    cell("repo", line.repo),
+    cell("detail", line.detail),
+  );
+  feed.prepend(row);
+  if (feed.parentElement.scrollTop) feed.parentElement.scrollTop = 0; // live = pinned to newest
+  while (feed.childElementCount > MAX_FEED_LINES) feed.lastElementChild.remove();
+
+  if (animate && row.animate) {
+    // Slide the whole list down by one row so nothing jumps, and fade the new row in.
+    const h = row.offsetHeight;
+    feed.animate([{ transform: `translateY(${-h}px)` }, { transform: "translateY(0)" }],
+      { duration, easing: "cubic-bezier(.2,.7,.3,1)" });
+    row.animate([{ opacity: 0 }, { opacity: 1 }], { duration, easing: "ease-out" });
+  }
+
+  if (!count) return;
+  if (line.at > lastShownAt) lastShownAt = line.at;
+  recent.push(line);
+  if (recent.length > SAVE_LINES) recent.shift();
+  stats.total++;
+  stats.who[line.who]++;
+  stats.group[line.group]++;
+  stats.repos.set(line.repo, (stats.repos.get(line.repo) || 0) + 1);
+  if (stats.repos.size > REPO_TALLY_KEEP * 1.2) {
+    const keep = [...stats.repos].sort((a, b) => b[1] - a[1]).slice(0, REPO_TALLY_KEEP);
+    stats.repos = new Map(keep);
+  }
+  totalEl.textContent = stats.total.toLocaleString();
+}
+
+// Spread each poll's events evenly across the wait until the next poll.
+function drip() {
+  let delay = DRIP_IDLE_MS;
+  if (!paused && buffer.length) {
+    const remaining = net.nextPollAt - Date.now();
+    delay = Math.min(DRIP_MAX_MS, Math.max(DRIP_MIN_MS, remaining / (buffer.length + 1)));
+    render(buffer.shift(), true, Math.min(400, delay * 0.9));
+  }
+  setTimeout(drip, delay);
+}
+
+// ---- Side panel -----------------------------------------------------------------
+function barRow(label, color, icon) {
+  const row = document.createElement("div");
+  row.className = "bar";
+  const fill = document.createElement("div");
+  fill.className = "fill";
+  fill.style.background = color;
+  const track = document.createElement("div");
+  track.className = "track";
+  track.append(fill);
+  const val = cell("val", "0");
+  const labelEl = cell("label", label);
+  if (icon) {
+    const svg = makeIcon(icon);
+    svg.style.color = color;
+    labelEl.prepend(svg);
+  }
+  row.append(labelEl, track, val);
+  return { row, fill, val };
+}
+
+const whoRows = document.querySelector("#who .rows");
+const whoBars = {};
+for (const [k, g] of Object.entries(WHO)) {
+  whoBars[k] = barRow(g.label, g.color, g.icon);
+  whoRows.append(whoBars[k].row);
+}
+const kindRows = document.querySelector("#kinds .rows");
+const kindBars = {};
+for (const [k, g] of Object.entries(GROUPS)) {
+  kindBars[k] = barRow(g.label, g.color);
+  kindRows.append(kindBars[k].row);
+}
+const repoRows = document.querySelector("#repos .rows");
+const repoCells = [];
+for (let i = 0; i < TOP_REPOS; i++) {
+  const row = document.createElement("a");
+  row.className = "repo-row";
+  row.target = "_blank";
+  row.rel = "noopener noreferrer";
+  const name = cell("name", "");
+  const count = cell("c", "");
+  row.append(cell("n", i + 1 + "."), name, count);
+  repoRows.append(row);
+  repoCells.push({ row, name, count });
+}
+
+function updatePanel() {
+  saveState();
+  const total = stats.total || 1;
+  for (const k of Object.keys(WHO)) {
+    const pct = Math.round((stats.who[k] / total) * 100);
+    whoBars[k].fill.style.width = pct + "%";
+    whoBars[k].val.textContent = pct + "%";
+  }
+  const kinds = Object.keys(GROUPS).sort((a, b) => stats.group[b] - stats.group[a]);
+  const max = Math.max(1, ...kinds.map(k => stats.group[k]));
+  kinds.forEach(k => {
+    const b = kindBars[k];
+    b.fill.style.width = (stats.group[k] / max) * 100 + "%";
+    b.val.textContent = stats.group[k].toLocaleString();
+    kindRows.append(b.row); // re-append in sorted order
+  });
+  const top = [...stats.repos].sort((a, b) => b[1] - a[1]).slice(0, TOP_REPOS);
+  repoCells.forEach((c, i) => {
+    const repo = top[i] ? top[i][0] : "";
+    if (c.name.textContent !== repo) {
+      c.name.textContent = repo;
+      if (repo) c.row.href = GH + repo.split("/").map(encodeURIComponent).join("/");
+      else c.row.removeAttribute("href");
+    }
+    c.count.textContent = top[i] ? top[i][1].toLocaleString() : "";
+  });
+}
+
+// ---- Footer status ----------------------------------------------------------------
+const statusEl = document.getElementById("status");
+const dotEl = document.getElementById("dot");
+
+function lagText() {
+  if (net.lagMs == null) return "";
+  const min = Math.round(net.lagMs / 60_000);
+  if (min < 1) return "GitHub is running under a minute behind";
+  if (min < 60) return `GitHub is running about ${min} min behind`;
+  const h = Math.floor(min / 60), m = min % 60;
+  return `GitHub is running about ${h} hr${m ? ` ${m} min` : ""} behind`;
+}
+
+function updateStatus() {
+  const secs = Math.max(0, Math.ceil((net.nextPollAt - Date.now()) / 1000));
+  let text, warn = true;
+  switch (net.state) {
+    case "ratelimit": text = `GitHub asked us to slow down. Back at ${clockFmt.format(net.resumeAt)}.`; break;
+    case "busy":      text = "GitHub is busy. Retrying shortly."; break;
+    case "offline":   text = "Offline. Retrying shortly."; break;
+    case "noserver":
+      text = location.protocol === "file:" && !DEMO
+        ? "Not connected. Run node server.mjs, then open http://localhost:8787"
+        : "Can't reach the firehose server. Retrying shortly.";
+      break;
+    case "connecting": text = "Connecting…"; warn = false; break;
+    default:
+      warn = false;
+      text = DEMO
+        ? `Demo data, not live · next update in ${secs}s`
+        : ["Live", `next update in ${secs}s`, lagText()].filter(Boolean).join(" · ");
+  }
+  if (!warn && Date.now() < SINCE_FILTER) text = `Starts at ${clockFmt.format(SINCE_AT)}. Nothing before then is shown.`;
+  if (paused) text = "Paused · scroll to look back · " + text;
+  statusEl.textContent = text;
+  statusEl.classList.toggle("warn", warn);
+  dotEl.classList.toggle("warn", warn);
+}
+
+// ---- Demo data ----------------------------------------------------------------------
+// Made-up people and repos, plus a few bot/agent-shaped logins to exercise classification.
+const DEMO_PEOPLE = ["maple-dev", "kwong-lab", "orbitfox", "tinkerjen", "pkoval", "riverstone", "ada-builds",
+  "nmoreau", "quietcoder", "lumen42", "sakura-tk", "beckett-r", "dtran", "hollow-pine", "mvasquez",
+  "jdoe", "fern-io", "okonkwo-e", "lin-a", "tobias-m", "zeynep-k", "harbor-light", "ravi-s", "ellie-w"];
+const DEMO_BOTS = ["dependabot[bot]", "renovate[bot]", "github-actions[bot]", "pre-commit-ci[bot]", "deploybot", "release-bot"];
+const DEMO_AGENTS = ["copilot-swe-agent[bot]", "claude[bot]", "coderabbitai[bot]", "devin-ai-integration[bot]", "codex-agent"];
+const DEMO_REPOS = ["acme/api", "maple-dev/garden-planner", "orbitfox/telemetry", "kwong-lab/protein-fold",
+  "riverstone/infra", "tinkerjen/dotfiles", "hudson-makers/badge-firmware", "lumen42/shader-toy",
+  "quietcoder/notes", "ada-builds/compiler-from-scratch", "fern-io/fern", "harbor-light/website",
+  "sakura-tk/kanji-flashcards", "dtran/budget-cli", "beckett-r/bike-routes", "openmeadow/ui-kit"];
+const DEMO_BRANCHES = ["main", "dev", "fix/login-redirect", "feat/dark-mode", "docs/readme", "chore/deps", "release/2.4"];
+const DEMO_TITLES = ["Add retry to webhook sender", "Crash when config file is empty", "Support Python 3.13",
+  "Docs: clarify install steps", "Flaky test in CI on macOS", "Speed up cold start", "Bump lodash to 4.17.21"];
+const DEMO_DESCS = ["A tiny CLI for tracking habits", "Weekend project: plant watering reminders",
+  "Experiments with WebGPU", "Notes from the reading group", "Static site for our meetup"];
+const DEMO_TYPES = [["PushEvent", 52], ["CreateEvent", 11], ["PullRequestEvent", 9], ["WatchEvent", 8],
+  ["IssueCommentEvent", 5], ["IssuesEvent", 4], ["DeleteEvent", 3], ["PullRequestReviewEvent", 3],
+  ["ForkEvent", 2], ["ReleaseEvent", 1], ["GollumEvent", 1], ["PublicEvent", 0.5], ["MemberEvent", 0.5]];
+let demoId = 1e12;
+
+const pick = a => a[Math.floor(Math.random() * a.length)];
+function pickType() {
+  let r = Math.random() * DEMO_TYPES.reduce((s, t) => s + t[1], 0);
+  for (const [t, w] of DEMO_TYPES) if ((r -= w) <= 0) return t;
+  return "PushEvent";
+}
+
+function demoEvent(at) {
+  const type = pickType();
+  const roll = Math.random();
+  const login = roll < 0.12 ? pick(DEMO_AGENTS) : roll < 0.38 ? pick(DEMO_BOTS) : pick(DEMO_PEOPLE);
+  const n = 1 + Math.floor(Math.random() * 900);
+  const payloads = {
+    PushEvent: { ref: "refs/heads/" + pick(DEMO_BRANCHES) },
+    CreateEvent: Math.random() < 0.3
+      ? { ref_type: "repository", description: pick(DEMO_DESCS) }
+      : { ref_type: Math.random() < 0.85 ? "branch" : "tag", ref: pick(DEMO_BRANCHES) },
+    DeleteEvent: { ref_type: "branch", ref: pick(DEMO_BRANCHES) },
+    PullRequestEvent: { action: pick(["opened", "merged", "closed", "reopened", "labeled"]), number: n, pull_request: { number: n } },
+    PullRequestReviewEvent: { action: "created", pull_request: { number: n } },
+    IssuesEvent: { action: pick(["opened", "closed"]), issue: { number: n, title: pick(DEMO_TITLES) } },
+    IssueCommentEvent: { action: "created", issue: { number: n, title: pick(DEMO_TITLES) } },
+    ReleaseEvent: { release: { tag_name: `v${1 + (n % 4)}.${n % 10}.${n % 7}` } },
+  };
+  return {
+    id: String(demoId++), type,
+    actor: { login, display_login: login },
+    repo: { name: pick(DEMO_REPOS) },
+    payload: payloads[type] || {},
+    created_at: new Date(at).toISOString(),
+  };
+}
+
+function demoBatch() {
+  // About what the live server delivers, timestamped as if GitHub were ~3 minutes behind.
+  const span = DEMO_POLL_MS;
+  const count = Math.round((DEMO_PER_MINUTE * span) / 60_000);
+  const end = Date.now() - 180_000;
+  const events = [];
+  // Like the real feed, ~10% arrive late (up to 50 minutes old).
+  for (let i = 0; i < count; i++) {
+    const late = Math.random() < 0.1 ? Math.random() * 50 * 60_000 : 0;
+    events.push(demoEvent(end - Math.random() * span - late));
+  }
+  if (MOCK === "blocked") {
+    const at = new Date(end).toISOString();
+    events.push(
+      { id: String(demoId++), type: "WatchEvent", actor: { login: "pornking99" }, repo: { name: "acme/api" }, payload: {}, created_at: at },
+      { id: String(demoId++), type: "WatchEvent", actor: { login: "jdoe" }, repo: { name: "someone/NSFW-gallery" }, payload: {}, created_at: at },
+      { id: String(demoId++), type: "PushEvent", actor: { login: "jdoe" }, repo: { name: "acme/api" }, payload: { ref: "refs/heads/hentai-viewer" }, created_at: at },
+    );
+  }
+  return events.sort(() => Math.random() - 0.5); // GitHub's order isn't strict either
+}
+
+// ---- Screen behavior --------------------------------------------------------------------
+const hintEl = document.getElementById("hint");
+
+function toggleFullscreen() {
+  const d = document, el = d.documentElement;
+  try {
+    if (d.fullscreenElement || d.webkitFullscreenElement) (d.exitFullscreen || d.webkitExitFullscreen).call(d);
+    else (el.requestFullscreen || el.webkitRequestFullscreen).call(el);
+  } catch (_) { /* not available: ignore */ }
+}
+function onFullscreenChange() {
+  hintEl.hidden = !!(document.fullscreenElement || document.webkitFullscreenElement);
+}
+document.addEventListener("fullscreenchange", onFullscreenChange);
+document.addEventListener("webkitfullscreenchange", onFullscreenChange);
+document.addEventListener("dblclick", e => {
+  if (!e.target.closest?.("a, button")) toggleFullscreen(); // double-clicking a line just opens it
+});
+document.addEventListener("keydown", e => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const k = e.key.toLowerCase();
+  if (k === "f") toggleFullscreen();
+  if (k === "p") setPaused(!paused);
+});
+
+let wakeLock = null;
+async function requestWakeLock() {
+  try {
+    if ("wakeLock" in navigator && document.visibilityState === "visible") {
+      wakeLock = await navigator.wakeLock.request("screen");
+    }
+  } catch (_) { /* nice-to-have; caffeinate covers it */ }
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") requestWakeLock();
+});
+
+let cursorTimer = 0;
+function wakeCursor() {
+  document.body.classList.remove("nocursor");
+  clearTimeout(cursorTimer);
+  cursorTimer = setTimeout(() => document.body.classList.add("nocursor"), CURSOR_HIDE_MS);
+}
+document.addEventListener("mousemove", wakeCursor);
+document.addEventListener("wheel", wakeCursor, { passive: true });
+
+// Pause holds the drip (polling continues and buffers) and lets the feed scroll.
+const pauseBtn = document.getElementById("pause");
+const feedBody = document.querySelector(".feed-body");
+function setPaused(on) {
+  paused = on;
+  document.body.classList.toggle("paused", on);
+  pauseBtn.textContent = on ? "▶ Resume" : "❚❚ Pause";
+  if (!on) feedBody.scrollTop = 0; // back to the newest line before it moves again
+  updateStatus();
+}
+pauseBtn.addEventListener("click", () => setPaused(!paused));
+// Live, the feed is pinned to the newest line, even against keyboard focus or link tabbing.
+feedBody.addEventListener("scroll", () => { if (!paused && feedBody.scrollTop) feedBody.scrollTop = 0; });
+
+window.addEventListener("online", () => {
+  if (net.state === "noserver") { net.backoff = 0; schedulePoll(0); }
+});
+
+// ---- Go ---------------------------------------------------------------------------------
+document.getElementById("total-label").textContent = `events since ${clockFmt.format(SINCE_AT)}`;
+restoreState();
+window.addEventListener("pagehide", saveState);
+requestWakeLock();
+wakeCursor();
+updatePanel();
+poll();
+drip();
+setInterval(updatePanel, PANEL_REFRESH_MS);
+setInterval(updateStatus, 1_000);
+</script>
+</body>
+</html>
