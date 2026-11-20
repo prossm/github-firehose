@@ -2,6 +2,8 @@
 
 A full-screen lobby display of live public GitHub activity: a scrolling feed of pushes, pull requests, issues, reviews and releases from the last hour, plus a side panel of who is doing the work (people, bots, AI agents), what kind of work it is, and the busiest repos.
 
+![The GitHub Firehose screen: a live feed of GitHub events on the left, with who's doing the work, what kind of work, and the busiest repos on the right](docs/firehose.gif)
+
 Built for a 1920×1080 TV; scales to 720p and 4K.
 
 ## Run it
